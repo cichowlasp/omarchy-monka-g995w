@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """MONKA G995W host helper.
 
 Talks to the vendor interface of the MONKA G995W (1d57:fa60 wireless dongle,

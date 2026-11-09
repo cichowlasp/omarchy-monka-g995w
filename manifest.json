@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.cichowlasp.monka-g995w",
   "name": "MONKA G995W",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Piotr Cichowlas",
   "license": "MIT",
   "description": "Battery, DPI stages, polling rate and lighting controls for the MONKA G995W wireless mouse over 2.4 GHz, Bluetooth or USB-C, using its vendor HID and BLE reports.",
