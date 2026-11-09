@@ -1,0 +1,581 @@
+#!/usr/bin/env python3
+"""MONKA G995W host helper.
+
+Talks to the vendor HID interface of the MONKA G995W (1d57:fa60 wireless
+dongle, 1d57:fa61 wired) and implements:
+
+  battery      passive battery/status report (report 0x03 on 000A:0000)
+  device       which interfaces are present
+  state        locally stored settings (the device cannot be read back)
+  set-dpi      report 0x04 / sub-command 0x38
+  set-poll     report 0x06 / sub-command 0x09
+  set-light    report 0x05 / sub-command 0x0F
+  set-profile  report 0x0C / sub-command 0x0A
+  raw          send an arbitrary feature report (debugging)
+
+Feature reports are written with HIDIOCSFEATURE.  The vendor app reads its
+settings from the on-disk profile instead of the mouse, so this helper keeps
+the same kind of local state and writes it on every change.
+"""
+
+import fcntl
+import glob
+import json
+import os
+import select
+import sys
+import time
+
+VID = "00001D57"
+PIDS = ("0000FA60", "0000FA61")
+
+REPORT_ID_STATUS = 0x03
+
+# 05 0a 09 00 a1 01 85 03 -- Usage Page (Telephony), Usage 0, Collection
+# (Application), Report ID 3.  Carries the battery/status notifications.
+STATUS_COLLECTION = bytes((0x05, 0x0A, 0x09, 0x00, 0xA1, 0x01, 0x85, 0x03))
+# 05 0b 09 00 a1 01 85 04 -- vendor feature collection.  The report IDs we
+# write below live here.
+VENDOR_COLLECTION = bytes((0x05, 0x0B, 0x09, 0x00, 0xA1, 0x01, 0x85, 0x04))
+
+STATE_PATH = os.path.expanduser("~/.local/state/monka-g995w.json")
+
+DEFAULT_STATE = {
+    "dpi": {
+        "values": [800, 1600, 3200, 4800, 8000, 26000],
+        "active": 2,
+        "colors": ["#ff0000", "#00ff00", "#0000ff", "#00ffff", "#0000ff", "#ff00ff"],
+    },
+    "polling": 1000,
+    "light": {"mode": 5, "brightness": 3, "speed": 8, "color": "#0000ff"},
+    "profile": 1,
+}
+
+LIGHT_MODES = {
+    0: "Off",
+    1: "Static",
+    2: "Breathing",
+    3: "Neon",
+    4: "Color breathing",
+    5: "Static (DPI)",
+    6: "Breathing (DPI)",
+}
+
+POLLING_BYTES = {125: 8, 250: 3, 500: 2, 1000: 1}
+
+# HIDIOCSFEATURE(len) / HIDIOCGFEATURE(len)
+def _ioc(dir_, type_, nr, size):
+    return (dir_ << 30) | (ord(type_) << 8) | nr | (size << 16)
+
+
+HIDIOCSFEATURE = lambda n: _ioc(3, "H", 0x06, n)
+HIDIOCGFEATURE = lambda n: _ioc(3, "H", 0x07, n)
+
+
+def _read(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return b""
+
+
+def hidraw_nodes():
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        uevent = _read(os.path.join(node, "device", "uevent")).decode("ascii", "replace")
+        hid_id = ""
+        name = ""
+        for line in uevent.splitlines():
+            if line.startswith("HID_ID="):
+                hid_id = line.split("=", 1)[1].strip().upper()
+            elif line.startswith("HID_NAME="):
+                name = line.split("=", 1)[1].strip()
+        yield "/dev/" + os.path.basename(node), hid_id, name, _read(
+            os.path.join(node, "device", "report_descriptor")
+        )
+
+
+def find_status():
+    """Node carrying the passive battery/status reports.
+
+    Wireless (fa60) is preferred: the wired device does not appear to send
+    status reports.
+    """
+    fallback = None
+    for pid in ("0000FA60", "0000FA61"):
+        for path, hid_id, _name, desc in hidraw_nodes():
+            if VID not in hid_id or pid not in hid_id:
+                continue
+            if STATUS_COLLECTION in desc:
+                if pid == "0000FA60":
+                    return path
+                fallback = fallback or path
+    return fallback
+
+
+def find_feature():
+    """Node carrying the vendor feature collection.
+
+    The wired device (fa61) is preferred for configuration, but both work.
+    """
+    fallback = None
+    for pid in ("0000FA61", "0000FA60"):
+        for path, hid_id, _name, desc in hidraw_nodes():
+            if VID not in hid_id or pid not in hid_id:
+                continue
+            if VENDOR_COLLECTION in desc:
+                if pid == "0000FA61":
+                    return path
+                fallback = fallback or path
+    return fallback
+
+
+def decode_status(report):
+    """Decode the vendor status report (same math as the Windows driver)."""
+    if len(report) < 5 or report[0] != REPORT_ID_STATUS:
+        return None
+    model = report[1]
+    event = report[2]
+    charge_state = report[3]
+    level = report[4]
+    if 6 <= level <= 9:
+        percent = (level + 1) * 10
+    elif level == 10:
+        percent = 100
+    elif 1 <= level <= 5:
+        percent = level * 10
+    else:
+        percent = None
+    return {
+        "model": model,
+        "event": event,
+        "level": level,
+        "percent": percent,
+        "chargeState": charge_state,
+        "charging": charge_state == 0,
+        "raw": " ".join(f"{b:02x}" for b in report[:5]),
+    }
+
+
+def read_status_report(path, timeout=4.0):
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                return None
+            try:
+                data = os.read(fd, 64)
+            except BlockingIOError:
+                continue
+            except OSError:
+                return None
+            if len(data) >= 5 and data[0] == REPORT_ID_STATUS:
+                return data
+    finally:
+        os.close(fd)
+
+
+def emit(payload, code=0):
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    return code
+
+
+def device_info():
+    wireless = wired = feature = None
+    for path, hid_id, _name, desc in hidraw_nodes():
+        if VID not in hid_id:
+            continue
+        if "0000FA60" in hid_id and STATUS_COLLECTION in desc and wireless is None:
+            wireless = path
+        if "0000FA61" in hid_id and VENDOR_COLLECTION in desc and wired is None:
+            wired = path
+        if VENDOR_COLLECTION in desc and feature is None:
+            feature = path
+    return {"wireless": wireless, "wired": wired, "feature": feature}
+
+
+def load_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {}
+    state = json.loads(json.dumps(DEFAULT_STATE))
+    if isinstance(data, dict):
+        for key in ("dpi", "light"):
+            if isinstance(data.get(key), dict):
+                state[key].update(data[key])
+        for key in ("polling", "profile"):
+            if key in data:
+                state[key] = data[key]
+    return state
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        pass
+
+
+def parse_color(value):
+    value = str(value or "").strip().lstrip("#")
+    if len(value) != 6:
+        raise ValueError("color must be RRGGBB")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def color_hex(rgb):
+    return "#%02x%02x%02x" % rgb
+
+
+def dpi_report(values, active, colors, stage_mask=0x3F):
+    report = bytearray(52)
+    report[0] = 0x04
+    report[1] = 0x38
+    report[2] = 0x01
+    # bytes 3 and 4 are the vendor "mouse attribute" bytes.  Byte 5 is the
+    # bitmask of enabled DPI stages; the stock profile enables the six stages
+    # the UI shows.  Bytes 6 and 7 are two further masks that the vendor app
+    # leaves at zero.
+    report[5] = stage_mask & 0xFF
+    for index, dpi in enumerate(values[:8]):
+        encoded = int(dpi) // 50 - 1
+        if encoded >= 0:
+            report[8 + index] = encoded & 0xFF
+            report[16 + index] = (encoded >> 8) & 0xFF
+    report[24] = max(1, min(8, int(active))) & 0xFF
+    for index in range(8):
+        rgb = colors[index] if index < len(colors) else (0, 0, 0)
+        report[25 + index * 3] = rgb[0]
+        report[26 + index * 3] = rgb[1]
+        report[27 + index * 3] = rgb[2]
+    report[49] = 0x01
+    checksum = sum(report[3:50]) & 0xFFFF
+    report[50] = (checksum >> 8) & 0xFF
+    report[51] = checksum & 0xFF
+    return report
+
+
+def poll_report(hz):
+    value = POLLING_BYTES[int(hz)]
+    return bytes((0x06, 0x09, 0x01, value, (~value) & 0xFF, 0, 0, 0, 0))
+
+
+def light_report(mode, brightness, speed, rgb):
+    report = bytearray(13)
+    report[0] = 0x05
+    report[1] = 0x0F
+    report[2] = 0x01
+    report[3] = (int(mode) & 0x0F) << 4
+    report[4] = (9 - int(brightness)) & 0xFF
+    report[5] = int(speed) & 0xFF
+    report[6], report[7], report[8] = rgb
+    report[9] = 0x01
+    report[10] = 0x00
+    checksum = sum(report[3:10]) & 0xFFFF
+    report[11] = (checksum >> 8) & 0xFF
+    report[12] = checksum & 0xFF
+    return report
+
+
+def profile_report(slot):
+    report = bytearray(10)
+    report[0] = 0x0C
+    report[1] = 0x0A
+    report[2] = 0x01
+    report[3] = 0xFE
+    report[4] = 0x01
+    report[5] = 0xFE
+    return report
+
+
+def send_report(report, expect_ack=True):
+    path = find_feature()
+    if not path:
+        return {"ok": False, "error": "device-not-found"}
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    except OSError as exc:
+        return {"ok": False, "error": "open-failed", "detail": str(exc), "device": path}
+
+    command = int(report[0])
+    ack = None
+    try:
+        try:
+            fcntl.ioctl(fd, HIDIOCSFEATURE(len(report)), bytes(report))
+        except OSError as exc:
+            return {"ok": False, "error": "write-failed", "errno": exc.errno, "detail": exc.strerror, "device": path}
+
+        if expect_ack:
+            deadline = time.monotonic() + 2.5
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select([fd], [], [], remaining)
+                if not ready:
+                    break
+                try:
+                    data = os.read(fd, 64)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    break
+                if (
+                    len(data) >= 5
+                    and data[0] == REPORT_ID_STATUS
+                    and data[1] == 0x10
+                    and data[2] == 0x50
+                    and data[4] == command
+                ):
+                    ack = " ".join(f"{b:02x}" for b in data[:5])
+                    break
+    finally:
+        os.close(fd)
+
+    return {
+        "ok": True,
+        "command": command,
+        "ack": ack,
+        "sent": " ".join(f"{b:02x}" for b in report),
+        "device": path,
+    }
+
+
+def cmd_battery():
+    info = device_info()
+    path = info["wireless"]
+    if path:
+        report = read_status_report(path)
+        if report is not None:
+            decoded = decode_status(report)
+            if decoded is not None:
+                decoded.update({"ok": True, "device": path, "wired": bool(info["wired"]), "ts": int(time.time())})
+                return emit(decoded)
+    if info["wired"]:
+        return emit({
+            "ok": True,
+            "device": info["wired"],
+            "wired": True,
+            "charging": True,
+            "percent": 100,
+            "level": None,
+            "chargeState": None,
+            "raw": "",
+            "ts": int(time.time()),
+        })
+    return emit({"ok": False, "error": "device-not-found"})
+
+
+def cmd_device():
+    info = device_info()
+    info["ok"] = bool(info["wireless"] or info["wired"])
+    return emit(info)
+
+
+def cmd_state():
+    return emit({"ok": True, "state": load_state()})
+
+
+def _finish(result, state):
+    save_state(state)
+    result["state"] = state
+    return emit(result)
+
+
+def cmd_set_dpi(values, active, wait_ack=True):
+    state = load_state()
+    parsed = []
+    for raw in values.split(","):
+        value = int(round(int(raw) / 50.0)) * 50
+        parsed.append(max(50, min(26000, value)))
+    while len(parsed) < 6:
+        parsed.append(parsed[-1] if parsed else 800)
+    parsed = parsed[:6]
+    active = max(1, min(6, int(active)))
+    state["dpi"]["values"] = parsed
+    state["dpi"]["active"] = active
+    colors = [parse_color(c) for c in state["dpi"].get("colors", [])]
+    result = send_report(dpi_report(parsed, active, colors), expect_ack=wait_ack)
+    return _finish(result, state)
+
+
+def cmd_set_poll(hz):
+    hz = int(hz)
+    if hz not in POLLING_BYTES:
+        return emit({"ok": False, "error": "invalid-polling", "value": hz})
+    state = load_state()
+    state["polling"] = hz
+    result = send_report(poll_report(hz))
+    return _finish(result, state)
+
+
+def cmd_set_light(mode, brightness, speed, color):
+    mode = max(0, min(6, int(mode)))
+    brightness = max(1, min(8, int(brightness)))
+    speed = max(4, min(8, int(speed)))
+    rgb = parse_color(color)
+    state = load_state()
+    state["light"] = {"mode": mode, "brightness": brightness, "speed": speed, "color": color_hex(rgb)}
+    # The mouse only re-reads the RGB value when the lighting mode changes.
+    # The Windows app's users work around this by selecting Off and then the
+    # wanted mode again, so do the same here before the real write.
+    if mode != 0:
+        send_report(light_report(0, brightness, speed, rgb), expect_ack=False)
+        time.sleep(0.12)
+    result = send_report(light_report(mode, brightness, speed, rgb))
+    if result.get("ok") and not result.get("ack"):
+        time.sleep(0.2)
+        result = send_report(light_report(mode, brightness, speed, rgb))
+    return _finish(result, state)
+
+
+def cmd_set_profile(slot):
+    slot = max(1, min(5, int(slot)))
+    state = load_state()
+    state["profile"] = slot
+    result = send_report(profile_report(slot))
+    return _finish(result, state)
+
+
+def status_nodes():
+    """Every HID node carrying the passive status collection.
+
+    Wireless (fa60) and wired (fa61) can both be present.  The mouse sends
+    battery reports on the wireless node and button events (DPI/lighting) on
+    whichever interface it is currently using, so the watcher reads both.
+    """
+    nodes = []
+    for path, hid_id, _name, desc in hidraw_nodes():
+        if VID in hid_id and STATUS_COLLECTION in desc and path not in nodes:
+            nodes.append(path)
+    return nodes
+
+
+def cmd_watch():
+    """Stream status reports as JSON lines from every status interface."""
+    fds = {}
+    while True:
+        nodes = status_nodes()
+        for fd, path in list(fds.items()):
+            if path not in nodes:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                del fds[fd]
+        for path in nodes:
+            if path in fds.values():
+                continue
+            try:
+                fds[os.open(path, os.O_RDONLY | os.O_NONBLOCK)] = path
+            except OSError:
+                pass
+        if not fds:
+            time.sleep(2)
+            continue
+
+        try:
+            ready, _, _ = select.select(list(fds), [], [], 1.0)
+        except OSError:
+            ready = []
+
+        for fd in ready:
+            path = fds.get(fd, "")
+            try:
+                data = os.read(fd, 64)
+            except BlockingIOError:
+                continue
+            except OSError:
+                fds.pop(fd, None)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                continue
+            if not data:
+                fds.pop(fd, None)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                continue
+            if len(data) < 3 or data[0] != REPORT_ID_STATUS:
+                continue
+            model = data[1]
+            event = data[2]
+            raw = " ".join(f"{b:02x}" for b in data[:5])
+            if model == 0x10 and event == 0x40:
+                decoded = decode_status(data)
+                if decoded is not None:
+                    decoded.update({"kind": "battery", "ok": True, "device": path, "ts": int(time.time())})
+                    emit(decoded)
+            elif model == 0x00 and event == 0x10:
+                emit({
+                    "kind": "dpi",
+                    "ok": True,
+                    "stage": data[3] if len(data) > 3 else 0,
+                    "raw": raw,
+                    "device": path,
+                })
+            elif model == 0x00 and event == 0x70:
+                emit({
+                    "kind": "light",
+                    "ok": True,
+                    "mode": data[3] if len(data) > 3 else 0,
+                    "raw": raw,
+                    "device": path,
+                })
+
+
+def cmd_raw(hex_string):
+    try:
+        report = bytes.fromhex(hex_string.replace(" ", ""))
+    except ValueError:
+        return emit({"ok": False, "error": "invalid-hex"})
+    if not report:
+        return emit({"ok": False, "error": "empty"})
+    return emit(send_report(report))
+
+
+def main(argv):
+    command = argv[1] if len(argv) > 1 else "battery"
+    if command == "battery":
+        return cmd_battery()
+    if command == "watch":
+        return cmd_watch()
+    if command == "device":
+        return cmd_device()
+    if command == "state":
+        return cmd_state()
+    if command == "set-dpi" and len(argv) >= 4:
+        return cmd_set_dpi(argv[2], argv[3], wait_ack="--fast" not in argv[4:])
+    if command == "set-poll" and len(argv) >= 3:
+        return cmd_set_poll(argv[2])
+    if command == "set-light" and len(argv) >= 6:
+        return cmd_set_light(argv[2], argv[3], argv[4], argv[5])
+    if command == "set-profile" and len(argv) >= 3:
+        return cmd_set_profile(argv[2])
+    if command == "raw" and len(argv) >= 3:
+        return cmd_raw(argv[2])
+    return emit({
+        "ok": False,
+        "error": "bad-command",
+        "usage": "battery|watch|device|state|set-dpi <v1,..,v6> <active>|set-poll <hz>|set-light <mode> <brightness> <speed> <rrggbb>|set-profile <slot>|raw <hex>",
+    })
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

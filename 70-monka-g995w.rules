@@ -1,0 +1,5 @@
+# MONKA G995W mouse (USB 1d57:fa60 wireless, 1d57:fa61 wired)
+# Grant the logged-in seat user access to the vendor HID interface so
+# userspace tools (and the Omarchy bar plugin) can read battery/config data.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1d57", ATTRS{idProduct}=="fa60", TAG+="uaccess", MODE="0660"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1d57", ATTRS{idProduct}=="fa61", TAG+="uaccess", MODE="0660"

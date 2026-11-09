@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.cichowlasp.monka-g995w",
+  "name": "MONKA G995W",
+  "version": "1.0.0",
+  "author": "Piotr Cichowlas",
+  "license": "MIT",
+  "description": "Battery, DPI stages, polling rate and lighting controls for the MONKA G995W 2.4 GHz wireless mouse, using its vendor HID reports.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "MONKA G995W",
+    "description": "Shows the MONKA G995W mouse battery in the bar, warns near 10%, and controls DPI stages, polling rate and lighting from the panel.",
+    "category": "Devices",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "lowBatteryThreshold": 10,
+      "refreshIntervalSec": 60
+    },
+    "schema": [
+      {
+        "key": "lowBatteryThreshold",
+        "type": "integer",
+        "label": "Low battery warning (%)",
+        "description": "Send one notification when the mouse reaches this percentage while discharging.",
+        "min": 5,
+        "max": 50,
+        "step": 5,
+        "defaultValue": 10
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "description": "How often to read the mouse status report. The mouse sends one about every two seconds.",
+        "min": 15,
+        "max": 600,
+        "step": 15,
+        "defaultValue": 60
+      }
+    ]
+  }
+}
