@@ -6,6 +6,8 @@ A battery, DPI, polling-rate and lighting widget for the **MONKA G995W**
 The mouse exposes its settings through vendor HID feature reports. This plugin
 talks to them directly; the Windows driver is not needed.
 
+![MONKA G995W panel](preview.png)
+
 ## Features
 
 - Battery percentage in the bar, with one low-battery notification.
@@ -16,6 +18,8 @@ talks to them directly; the Windows driver is not needed.
 - Notification showing the stage and DPI when the mouse's own DPI button is
   used.
 - Works with the wireless dongle (`1d57:fa60`) and USB-C (`1d57:fa61`).
+- Bluetooth mode is not supported: it presents a different BLE HID interface
+  without the vendor report collections.
 
 ## Requirements
 
