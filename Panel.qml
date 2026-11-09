@@ -6,12 +6,13 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 
-// Bar widget and panel for the MONKA G995W 2.4 GHz wireless mouse.
+// Bar widget and panel for the MONKA G995W wireless mouse.
 //
-// Battery data arrives passively on the vendor status report (report 0x03).
-// DPI, polling rate and lighting are written as vendor feature reports; the
-// mouse cannot be read back, so the helper keeps the same kind of local
-// profile the Windows app uses.
+// Battery data arrives passively on the vendor status report (report 0x03),
+// or from the BlueZ battery service in Bluetooth mode.  DPI, polling rate and
+// lighting are written as vendor reports (HID feature reports on USB/2.4 GHz,
+// or the BLE vendor channel over Bluetooth); the mouse cannot be read back, so
+// the helper keeps the same kind of local profile the Windows app uses.
 Panel {
   id: root
   moduleName: "io.github.cichowlasp.monka-g995w"
@@ -35,6 +36,7 @@ Panel {
   property bool haveData: false
   property bool charging: false
   property bool wired: false
+  property bool bluetooth: false
   property bool lowNotified: false
   property int batteryPercent: -1
   property int batteryLevel: -1
@@ -62,7 +64,14 @@ Panel {
   }
 
   readonly property string deviceText:
-    wired ? strings.t("panel.wired") : strings.t("panel.wireless")
+    bluetooth ? strings.t("panel.bluetooth")
+    : wired ? strings.t("panel.wired")
+    : strings.t("panel.wireless")
+
+  readonly property string modeText:
+    bluetooth ? strings.t("panel.metaBluetooth")
+    : wired ? strings.t("panel.metaWired")
+    : strings.t("panel.meta")
 
   readonly property string tooltipText: {
     if (!haveData) return strings.t("bar.tooltipUnknown")
@@ -125,12 +134,14 @@ Panel {
       failure = data && data.error ? String(data.error) : "unknown"
       haveData = false
       wired = false
+      bluetooth = false
       return
     }
 
     failure = ""
     haveData = true
     wired = data.wired === true
+    bluetooth = data.bluetooth === true || data.bt === true
     devicePath = String(data.device || "")
     rawReport = String(data.raw || "")
     batteryLevel = data.level === null || data.level === undefined ? -1 : Number(data.level)
@@ -169,6 +180,7 @@ Panel {
       return
     }
     if (!data || data.ok !== true) return
+    if (data.bluetooth === true) bluetooth = true
 
     if (data.kind === "battery") {
       applyData(data)
@@ -188,7 +200,9 @@ Panel {
         "-r", "9951",
         "DPI " + (dpi === undefined ? "" : dpi),
         strings.t("panel.stage").arg(stage) + " · "
-          + (wired ? strings.t("panel.wired") : strings.t("panel.wireless"))
+          + (root.bluetooth ? strings.t("panel.bluetooth")
+             : root.wired ? strings.t("panel.wired")
+             : strings.t("panel.wireless"))
       ]
       dpiNotifier.running = true
       return
@@ -359,6 +373,26 @@ Panel {
     onTriggered: watchProc.running = true
   }
 
+  // Bluetooth button events (the mouse's own DPI/lighting buttons) arrive on
+  // the BLE vendor notification channel rather than the USB status interface.
+  Process {
+    id: btWatchProc
+    command: [root.helperPath, "bt-watch"]
+    stdout: SplitParser {
+      onRead: function(line) { root.handleWatch(line) }
+    }
+    onExited: {
+      btWatchRestart.start()
+    }
+  }
+
+  Timer {
+    id: btWatchRestart
+    interval: 5000
+    repeat: false
+    onTriggered: btWatchProc.running = true
+  }
+
   Timer {
     id: dpiApplyTimer
     interval: 250
@@ -450,6 +484,7 @@ Panel {
   Component.onCompleted: {
     root.loadSettings()
     watchProc.running = true
+    btWatchProc.running = true
   }
 
   BarIconButton {
@@ -532,7 +567,7 @@ Panel {
         PanelHero {
           width: parent.width
           title: strings.t("panel.title")
-          meta: strings.t("panel.meta")
+          meta: root.modeText
           detail: root.haveData && root.batteryPercent >= 0
                   ? Commons.I18n.formatNumber(root.batteryPercent) + "%"
                   : "—"
@@ -582,8 +617,10 @@ Panel {
           width: parent.width
           visible: root.haveData && root.rawReport !== ""
           textFormat: Text.PlainText
-          text: strings.t("panel.levelShort") + " " + root.batteryLevel
-                + " · " + root.rawReport
+          text: (root.batteryLevel >= 0
+                 ? strings.t("panel.levelShort") + " " + root.batteryLevel + " · "
+                 : "")
+                + root.rawReport
                 + (root.updatedAt > 0
                    ? " · " + Qt.formatTime(new Date(root.updatedAt), "HH:mm:ss")
                    : "")
@@ -591,6 +628,17 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
+        }
+
+        Text {
+          width: parent.width
+          visible: root.bluetooth
+          textFormat: Text.PlainText
+          text: strings.t("panel.bluetoothHint")
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
 
         PanelSeparator { foreground: root.foreground }

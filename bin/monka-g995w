@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """MONKA G995W host helper.
 
-Talks to the vendor HID interface of the MONKA G995W (1d57:fa60 wireless
-dongle, 1d57:fa61 wired) and implements:
+Talks to the vendor interface of the MONKA G995W (1d57:fa60 wireless dongle,
+1d57:fa61 wired, and the G995W BLE HID device) and implements:
 
-  battery      passive battery/status report (report 0x03 on 000A:0000)
+  battery      passive status report, or the BLE battery service
   device       which interfaces are present
+  watch        stream battery and USB/2.4 GHz button events
+  bt-watch     stream DPI/lighting button events from the BLE channel
   state        locally stored settings (the device cannot be read back)
   set-dpi      report 0x04 / sub-command 0x38
   set-poll     report 0x06 / sub-command 0x09
   set-light    report 0x05 / sub-command 0x0F
   set-profile  report 0x0C / sub-command 0x0A
-  raw          send an arbitrary feature report (debugging)
+  raw          send an arbitrary report (debugging)
 
-Feature reports are written with HIDIOCSFEATURE.  The vendor app reads its
-settings from the on-disk profile instead of the mouse, so this helper keeps
-the same kind of local state and writes it on every change.
+On USB and the 2.4 GHz dongle, feature reports are written with
+HIDIOCSFEATURE.  In Bluetooth mode the same reports travel over the vendor BLE
+service (0xfee0): write to fee2/fee3, replies arrive as notifications on fee4.
+Battery level in Bluetooth mode comes from the standard BlueZ Battery1
+interface.
+
+The vendor app reads its settings from the on-disk profile instead of the
+mouse, so this helper keeps the same kind of local state and writes it on
+every change.
 """
 
 import fcntl
@@ -23,11 +31,20 @@ import glob
 import json
 import os
 import select
+import subprocess
 import sys
 import time
 
 VID = "00001D57"
 PIDS = ("0000FA60", "0000FA61")
+
+# Bluetooth mode: HID-over-GATT reports a Microsoft-style identifier
+# (0005:045E:0040) and the vendor protocol moves to this BLE service instead.
+BLE_NAME_HINTS = ("G995W",)
+BLE_WRITE = "0000fee3-0000-1000-8000-00805f9b34fb"
+BLE_WRITE_NR = "0000fee2-0000-1000-8000-00805f9b34fb"
+BLE_NOTIFY = "0000fee4-0000-1000-8000-00805f9b34fb"
+BLE_BATTERY = "00002a19-0000-1000-8000-00805f9b34fb"
 
 REPORT_ID_STATUS = 0x03
 
@@ -85,12 +102,15 @@ def hidraw_nodes():
         uevent = _read(os.path.join(node, "device", "uevent")).decode("ascii", "replace")
         hid_id = ""
         name = ""
+        uniq = ""
         for line in uevent.splitlines():
             if line.startswith("HID_ID="):
                 hid_id = line.split("=", 1)[1].strip().upper()
             elif line.startswith("HID_NAME="):
                 name = line.split("=", 1)[1].strip()
-        yield "/dev/" + os.path.basename(node), hid_id, name, _read(
+            elif line.startswith("HID_UNIQ="):
+                uniq = line.split("=", 1)[1].strip()
+        yield "/dev/" + os.path.basename(node), hid_id, name, uniq, _read(
             os.path.join(node, "device", "report_descriptor")
         )
 
@@ -103,7 +123,7 @@ def find_status():
     """
     fallback = None
     for pid in ("0000FA60", "0000FA61"):
-        for path, hid_id, _name, desc in hidraw_nodes():
+        for path, hid_id, _name, _uniq, desc in hidraw_nodes():
             if VID not in hid_id or pid not in hid_id:
                 continue
             if STATUS_COLLECTION in desc:
@@ -120,7 +140,7 @@ def find_feature():
     """
     fallback = None
     for pid in ("0000FA61", "0000FA60"):
-        for path, hid_id, _name, desc in hidraw_nodes():
+        for path, hid_id, _name, _uniq, desc in hidraw_nodes():
             if VID not in hid_id or pid not in hid_id:
                 continue
             if VENDOR_COLLECTION in desc:
@@ -128,6 +148,223 @@ def find_feature():
                     return path
                 fallback = fallback or path
     return fallback
+
+
+# ── Bluetooth ──────────────────────────────────────────────────────────────
+# In Bluetooth mode the mouse does not expose the USB vendor HID collection.
+# It does expose a vendor BLE service (0xfee0) whose characteristics carry the
+# same report bytes: write to fee2/fee3 and the mouse replies on fee4.  The
+# battery level comes from the standard BlueZ Battery1 interface.
+
+_BLUETOOTH = {"ts": 0.0, "info": None}
+_BLE_SESSION = {"bus": None, "notifyPath": None}
+
+
+def _busctl_json(args, timeout=5):
+    try:
+        proc = subprocess.run(
+            ["busctl", "--system", "--json=short", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return None
+
+
+def find_bluetooth():
+    """Locate the connected G995W over BlueZ and its vendor characteristics."""
+    addresses = set()
+    for _path, hid_id, _name, uniq, _desc in hidraw_nodes():
+        if hid_id.startswith("0005:") and uniq:
+            addresses.add(uniq.upper())
+
+    payload = _busctl_json([
+        "call",
+        "org.bluez",
+        "/",
+        "org.freedesktop.DBus.ObjectManager",
+        "GetManagedObjects",
+    ])
+    if not payload:
+        return None
+    try:
+        objects = payload["data"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    device = None
+    for path, interfaces in objects.items():
+        props = interfaces.get("org.bluez.Device1")
+        if not props:
+            continue
+        name = str(props.get("Name", {}).get("data", "")
+                   or props.get("Alias", {}).get("data", ""))
+        address = str(props.get("Address", {}).get("data", ""))
+        if not (any(hint in name.upper() for hint in BLE_NAME_HINTS)
+                or address.upper() in addresses):
+            continue
+        if not props.get("Connected", {}).get("data", False):
+            continue
+        device = (path, name, address)
+        break
+    if device is None:
+        return None
+
+    path, name, address = device
+    write = notify = battery_char = None
+    for obj, interfaces in objects.items():
+        if not obj.startswith(path + "/"):
+            continue
+        props = interfaces.get("org.bluez.GattCharacteristic1")
+        if not props:
+            continue
+        uuid = str(props.get("UUID", {}).get("data", "")).lower()
+        if uuid == BLE_WRITE:
+            # fee3 has a write response; prefer it over fee2.
+            write = obj
+        elif uuid == BLE_WRITE_NR and write is None:
+            write = obj
+        elif uuid == BLE_NOTIFY and notify is None:
+            notify = obj
+        elif uuid == BLE_BATTERY and battery_char is None:
+            battery_char = obj
+
+    battery = path if "org.bluez.Battery1" in objects.get(path, {}) else None
+    return {
+        "path": path,
+        "name": name,
+        "address": address,
+        "write": write,
+        "notify": notify,
+        "battery": battery,
+        "batteryChar": battery_char,
+    }
+
+
+def bluetooth_info(refresh=False):
+    now = time.monotonic()
+    cached = _BLUETOOTH["info"]
+    ttl = 3.0 if cached else 15.0
+    if not refresh and now - _BLUETOOTH["ts"] < ttl:
+        return cached
+    info = find_bluetooth()
+    _BLUETOOTH["ts"] = now
+    _BLUETOOTH["info"] = info
+    return info
+
+
+def bluetooth_battery(info):
+    if not info:
+        return None
+    if info.get("battery"):
+        payload = _busctl_json([
+            "get-property", "org.bluez", info["battery"],
+            "org.bluez.Battery1", "Percentage",
+        ])
+        if payload is not None:
+            try:
+                return int(payload["data"])
+            except (KeyError, TypeError, ValueError):
+                pass
+    if info.get("batteryChar"):
+        payload = _busctl_json([
+            "call", "org.bluez", info["batteryChar"],
+            "org.bluez.GattCharacteristic1", "ReadValue", "a{sv}", "0",
+        ])
+        if payload is not None:
+            data = payload.get("data")
+            if isinstance(data, list) and data:
+                try:
+                    return int(data[0])
+                except (TypeError, ValueError):
+                    pass
+    return None
+
+
+def _bluetooth_dbus():
+    try:
+        import dbus
+    except ImportError:
+        return None
+    try:
+        if _BLE_SESSION["bus"] is None:
+            _BLE_SESSION["bus"] = dbus.SystemBus()
+    except dbus.DBusException:
+        return None
+    return dbus
+
+
+def bluetooth_send_report(info, report, expect_ack=True, timeout=2.5):
+    dbus = _bluetooth_dbus()
+    if dbus is None:
+        return {
+            "ok": False,
+            "error": "python-dbus-missing",
+            "detail": "install python-dbus to control the mouse over Bluetooth",
+        }
+    if not info or not info.get("write") or not info.get("notify"):
+        return {"ok": False, "error": "bluetooth-not-ready"}
+
+    try:
+        bus = _BLE_SESSION["bus"]
+        notify_obj = bus.get_object("org.bluez", info["notify"])
+        notify = dbus.Interface(notify_obj, "org.bluez.GattCharacteristic1")
+        props = dbus.Interface(notify_obj, "org.freedesktop.DBus.Properties")
+
+        if _BLE_SESSION["notifyPath"] != info["notify"]:
+            if _BLE_SESSION["notifyPath"]:
+                try:
+                    old = bus.get_object("org.bluez", _BLE_SESSION["notifyPath"])
+                    dbus.Interface(old, "org.bluez.GattCharacteristic1").StopNotify()
+                except dbus.DBusException:
+                    pass
+            notify.StartNotify()
+            _BLE_SESSION["notifyPath"] = info["notify"]
+
+        writer = dbus.Interface(
+            bus.get_object("org.bluez", info["write"]),
+            "org.bluez.GattCharacteristic1",
+        )
+        writer.WriteValue(dbus.ByteArray(bytes(report)), {})
+
+        ack = None
+        if expect_ack:
+            command = int(report[0])
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    value = bytes(props.Get("org.bluez.GattCharacteristic1", "Value"))
+                except dbus.DBusException:
+                    value = b""
+                if (len(value) >= 4 and value[0] == 0x10
+                        and value[1] == 0x50 and value[3] == command):
+                    ack = " ".join(f"{b:02x}" for b in value)
+                    break
+                time.sleep(0.05)
+    except dbus.DBusException as exc:
+        _BLE_SESSION["notifyPath"] = None
+        return {
+            "ok": False,
+            "error": "bluetooth-write-failed",
+            "detail": str(exc),
+            "device": info["path"],
+        }
+
+    return {
+        "ok": True,
+        "command": int(report[0]),
+        "ack": ack,
+        "sent": " ".join(f"{b:02x}" for b in report),
+        "device": info["path"],
+        "transport": "bluetooth",
+    }
 
 
 def decode_status(report):
@@ -187,8 +424,12 @@ def emit(payload, code=0):
 
 
 def device_info():
-    wireless = wired = feature = None
-    for path, hid_id, _name, desc in hidraw_nodes():
+    wireless = wired = feature = bluetooth = None
+    for path, hid_id, name, _uniq, desc in hidraw_nodes():
+        if hid_id.startswith("0005:") and any(
+                hint in name.upper() for hint in BLE_NAME_HINTS):
+            bluetooth = bluetooth or path
+            continue
         if VID not in hid_id:
             continue
         if "0000FA60" in hid_id and STATUS_COLLECTION in desc and wireless is None:
@@ -197,7 +438,12 @@ def device_info():
             wired = path
         if VENDOR_COLLECTION in desc and feature is None:
             feature = path
-    return {"wireless": wireless, "wired": wired, "feature": feature}
+    return {
+        "wireless": wireless,
+        "wired": wired,
+        "feature": feature,
+        "bluetooth": bluetooth,
+    }
 
 
 def load_state():
@@ -301,10 +547,25 @@ def profile_report(slot):
     return report
 
 
-def send_report(report, expect_ack=True):
-    path = find_feature()
-    if not path:
-        return {"ok": False, "error": "device-not-found"}
+def choose_transport():
+    """Pick the interface the mouse is currently using.
+
+    A physical USB-C connection wins (it also reports charging), then an active
+    Bluetooth link, then the 2.4 GHz dongle.
+    """
+    info = device_info()
+    feature = find_feature()
+    if info["wired"] and feature:
+        return "usb", feature, None
+    bluetooth = bluetooth_info()
+    if bluetooth and bluetooth.get("write") and bluetooth.get("notify"):
+        return "bluetooth", bluetooth, bluetooth
+    if feature:
+        return "usb", feature, None
+    return None, None, bluetooth
+
+
+def usb_send_report(path, report, expect_ack=True):
     try:
         fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
     except OSError as exc:
@@ -351,37 +612,92 @@ def send_report(report, expect_ack=True):
         "ack": ack,
         "sent": " ".join(f"{b:02x}" for b in report),
         "device": path,
+        "transport": "usb",
     }
+
+
+def send_report(report, expect_ack=True):
+    transport, target, bluetooth = choose_transport()
+    if transport == "bluetooth":
+        return bluetooth_send_report(target, report, expect_ack)
+    if transport == "usb":
+        return usb_send_report(target, report, expect_ack)
+    if bluetooth:
+        return {
+            "ok": False,
+            "error": "bluetooth-not-ready",
+            "device": bluetooth.get("path"),
+        }
+    return {"ok": False, "error": "device-not-found"}
 
 
 def cmd_battery():
     info = device_info()
+    bluetooth = bluetooth_info(refresh=True)
+    bt_percent = bluetooth_battery(bluetooth) if bluetooth else None
+
+    if info["wired"]:
+        return emit({
+            "ok": True,
+            "device": info["wired"],
+            "wired": True,
+            "bluetooth": bool(bluetooth),
+            "bt": bool(bluetooth),
+            "charging": True,
+            "percent": bt_percent if bt_percent is not None else 100,
+            "level": None,
+            "chargeState": None,
+            "raw": "Bluetooth LE" if bt_percent is not None else "",
+            "ts": int(time.time()),
+        })
+
+    if bluetooth and bt_percent is not None:
+        return emit({
+            "ok": True,
+            "device": bluetooth["path"],
+            "wired": False,
+            "bluetooth": True,
+            "bt": True,
+            "charging": False,
+            "percent": bt_percent,
+            "level": None,
+            "chargeState": None,
+            "raw": "Bluetooth LE",
+            "ts": int(time.time()),
+        })
+
     path = info["wireless"]
     if path:
         report = read_status_report(path)
         if report is not None:
             decoded = decode_status(report)
             if decoded is not None:
-                decoded.update({"ok": True, "device": path, "wired": bool(info["wired"]), "ts": int(time.time())})
+                decoded.update({
+                    "ok": True,
+                    "device": path,
+                    "wired": False,
+                    "bluetooth": False,
+                    "ts": int(time.time()),
+                })
                 return emit(decoded)
-    if info["wired"]:
-        return emit({
-            "ok": True,
-            "device": info["wired"],
-            "wired": True,
-            "charging": True,
-            "percent": 100,
-            "level": None,
-            "chargeState": None,
-            "raw": "",
-            "ts": int(time.time()),
-        })
     return emit({"ok": False, "error": "device-not-found"})
 
 
 def cmd_device():
     info = device_info()
-    info["ok"] = bool(info["wireless"] or info["wired"])
+    bluetooth = bluetooth_info(refresh=True)
+    if bluetooth:
+        info["bluetoothDevice"] = bluetooth["path"]
+        info["bluetoothName"] = bluetooth["name"]
+        info["bluetoothAddress"] = bluetooth["address"]
+        info["bluetoothBattery"] = bluetooth_battery(bluetooth)
+    else:
+        info["bluetoothDevice"] = None
+        info["bluetoothName"] = None
+        info["bluetoothAddress"] = None
+        info["bluetoothBattery"] = None
+    info["ok"] = bool(info["wireless"] or info["wired"]
+                      or info["bluetooth"] or bluetooth)
     return emit(info)
 
 
@@ -458,15 +774,17 @@ def status_nodes():
     whichever interface it is currently using, so the watcher reads both.
     """
     nodes = []
-    for path, hid_id, _name, desc in hidraw_nodes():
+    for path, hid_id, _name, _uniq, desc in hidraw_nodes():
         if VID in hid_id and STATUS_COLLECTION in desc and path not in nodes:
             nodes.append(path)
     return nodes
 
 
 def cmd_watch():
-    """Stream status reports as JSON lines from every status interface."""
+    """Stream status reports and Bluetooth battery changes as JSON lines."""
     fds = {}
+    last_bt_percent = None
+    next_bt = 0.0
     while True:
         nodes = status_nodes()
         for fd, path in list(fds.items()):
@@ -483,12 +801,39 @@ def cmd_watch():
                 fds[os.open(path, os.O_RDONLY | os.O_NONBLOCK)] = path
             except OSError:
                 pass
+
+        now = time.monotonic()
+        if now >= next_bt:
+            next_bt = now + 5.0
+            bluetooth = bluetooth_info()
+            percent = bluetooth_battery(bluetooth) if bluetooth else None
+            if percent is None:
+                last_bt_percent = None
+            elif percent != last_bt_percent:
+                last_bt_percent = percent
+                wired = bool(device_info()["wired"])
+                emit({
+                    "kind": "battery",
+                    "ok": True,
+                    "device": bluetooth["path"],
+                    "wired": wired,
+                    "bluetooth": True,
+                    "bt": True,
+                    "charging": wired,
+                    "percent": percent,
+                    "level": None,
+                    "chargeState": None,
+                    "raw": "Bluetooth LE",
+                    "ts": int(time.time()),
+                })
+
         if not fds:
-            time.sleep(2)
+            time.sleep(1)
             continue
 
         try:
-            ready, _, _ = select.select(list(fds), [], [], 1.0)
+            ready, _, _ = select.select(
+                list(fds), [], [], max(0.2, min(1.0, next_bt - time.monotonic())))
         except OSError:
             ready = []
 
@@ -540,6 +885,119 @@ def cmd_watch():
                 })
 
 
+def cmd_bt_watch():
+    """Stream DPI/lighting events from the BLE vendor channel.
+
+    In Bluetooth mode the mouse does not expose the USB status collection.
+    Its button events arrive as notifications on fee4 instead, using the same
+    model/event bytes: 00 10 <stage> for DPI and 00 70 <mode> for lighting.
+    """
+    try:
+        import dbus
+        import dbus.mainloop.glib
+        from gi.repository import GLib
+    except ImportError as exc:
+        emit({"ok": False, "error": "python-dbus-missing", "detail": str(exc)})
+        # Keep the caller from restarting us in a tight loop.
+        time.sleep(60)
+        return 1
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    loop = GLib.MainLoop()
+    current = {"notifyPath": None, "notify": None}
+    last = {"value": None, "ts": 0.0}
+
+    def handle_value(value, path):
+        if len(value) < 3:
+            return
+        model = value[0]
+        event = value[1]
+        raw = " ".join(f"{b:02x}" for b in value)
+        if model == 0x00 and event == 0x10:
+            emit({
+                "kind": "dpi",
+                "ok": True,
+                "stage": value[2],
+                "raw": raw,
+                "device": path,
+                "bluetooth": True,
+                "ts": int(time.time()),
+            })
+        elif model == 0x00 and event == 0x70:
+            emit({
+                "kind": "light",
+                "ok": True,
+                "mode": value[2],
+                "raw": raw,
+                "device": path,
+                "bluetooth": True,
+                "ts": int(time.time()),
+            })
+
+    def on_props(interface, changed, invalidated, path=None):
+        if "Value" not in changed or str(path) != current["notifyPath"]:
+            return
+        value = bytes(changed["Value"])
+        now = time.monotonic()
+        # The mouse repeats some reports; collapse identical bursts.
+        if value == last["value"] and now - last["ts"] < 0.15:
+            return
+        last["value"] = value
+        last["ts"] = now
+        handle_value(value, str(path))
+
+    bus.add_signal_receiver(
+        on_props,
+        signal_name="PropertiesChanged",
+        dbus_interface="org.freedesktop.DBus.Properties",
+        path_keyword="path",
+    )
+
+    def connect():
+        info = bluetooth_info()
+        desired = info.get("notify") if info else None
+        if desired == current["notifyPath"]:
+            return True
+        if current["notifyPath"]:
+            try:
+                old = bus.get_object("org.bluez", current["notifyPath"])
+                dbus.Interface(old, "org.bluez.GattCharacteristic1").StopNotify()
+            except dbus.DBusException:
+                pass
+            current["notifyPath"] = None
+            current["notify"] = None
+        if not desired:
+            return True
+        try:
+            notify_obj = bus.get_object("org.bluez", desired)
+            notify = dbus.Interface(notify_obj, "org.bluez.GattCharacteristic1")
+            notify.StartNotify()
+            current["notifyPath"] = desired
+            current["notify"] = notify
+            last["value"] = None
+            last["ts"] = 0.0
+        except dbus.DBusException:
+            current["notifyPath"] = None
+            current["notify"] = None
+        return True
+
+    connect()
+    GLib.timeout_add_seconds(10, connect)
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if current["notifyPath"]:
+            try:
+                old = bus.get_object("org.bluez", current["notifyPath"])
+                dbus.Interface(old, "org.bluez.GattCharacteristic1").StopNotify()
+            except dbus.DBusException:
+                pass
+    return 0
+
+
 def cmd_raw(hex_string):
     try:
         report = bytes.fromhex(hex_string.replace(" ", ""))
@@ -556,6 +1014,8 @@ def main(argv):
         return cmd_battery()
     if command == "watch":
         return cmd_watch()
+    if command == "bt-watch":
+        return cmd_bt_watch()
     if command == "device":
         return cmd_device()
     if command == "state":
@@ -573,7 +1033,7 @@ def main(argv):
     return emit({
         "ok": False,
         "error": "bad-command",
-        "usage": "battery|watch|device|state|set-dpi <v1,..,v6> <active>|set-poll <hz>|set-light <mode> <brightness> <speed> <rrggbb>|set-profile <slot>|raw <hex>",
+        "usage": "battery|watch|bt-watch|device|state|set-dpi <v1,..,v6> <active>|set-poll <hz>|set-light <mode> <brightness> <speed> <rrggbb>|set-profile <slot>|raw <hex>",
     })
 
 
